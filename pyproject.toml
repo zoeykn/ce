@@ -7,8 +7,10 @@ requires-python = ">=3.13"
 dependencies = [
     "ipykernel>=6.0.0",
     "litellm>=1.0.0",
+    "matplotlib>=3.10.8",
     "numpy>=2.0.0",
     "openai>=1.0.0",
+    "pandas>=2.3.3",
     "pre-commit>=3.0.0",
     "pydantic>=2.0.0",
     "pytest>=8.0.0",
