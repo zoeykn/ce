@@ -39,3 +39,4 @@ build/
 
 # uv lock file (optional - uncomment if you want to track it)
 # uv.lock
+lectures/
