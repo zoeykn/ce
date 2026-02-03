@@ -27,6 +27,7 @@ __pycache__/
 temp/
 *.tmp
 *.log
+scripts/working-*
 
 # OS files
 .DS_Store

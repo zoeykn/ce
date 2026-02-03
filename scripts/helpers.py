@@ -5,10 +5,11 @@ Reusable utilities for search, embeddings, and evaluation.
 Usage:
     from helpers import (
         load_wands_products, load_wands_queries, load_wands_labels,
-        snowball_tokenize, build_index, score_bm25,
-        calculate_ndcg, evaluate_search,
-        get_embedding_openai, get_embedding_local, batch_embed_local,
-        cosine_similarity, batch_cosine_similarity
+        snowball_tokenize, build_index, score_bm25, search_bm25,
+        evaluate_search,
+        get_local_model, batch_embed_local, batch_embed_openai,
+        batch_cosine_similarity, semantic_search,
+        normalize_scores
     )
 """
 
@@ -154,68 +155,6 @@ def build_index(docs: list[str], tokenizer=None) -> tuple[dict, list[int]]:
     return index, doc_lengths
 
 
-def get_tf(term: str, doc_id: int, index: dict) -> int:
-    """
-    Get term frequency for a term in a document.
-
-    Args:
-        term: The term to look up
-        doc_id: The document ID
-        index: The inverted index
-
-    Returns:
-        Term frequency (count), or 0 if not found
-    """
-    return index.get(term, {}).get(doc_id, 0)
-
-
-def get_df(term: str, index: dict) -> int:
-    """
-    Get document frequency for a term.
-
-    Args:
-        term: The term to look up
-        index: The inverted index
-
-    Returns:
-        Number of documents containing the term
-    """
-    return len(index.get(term, {}))
-
-
-def bm25_idf(df: int, num_docs: int) -> float:
-    """
-    BM25 IDF formula.
-
-    Args:
-        df: Document frequency
-        num_docs: Total number of documents
-
-    Returns:
-        IDF score
-    """
-    return np.log((num_docs - df + 0.5) / (df + 0.5) + 1)
-
-
-def bm25_tf(
-    tf: int, doc_len: int, avg_doc_len: float, k1: float = 1.2, b: float = 0.75
-) -> float:
-    """
-    BM25 TF normalization.
-
-    Args:
-        tf: Term frequency
-        doc_len: Document length in tokens
-        avg_doc_len: Average document length
-        k1: Saturation parameter (default 1.2)
-        b: Length normalization (default 0.75)
-
-    Returns:
-        Normalized TF score
-    """
-    return (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / avg_doc_len))
-
-
 def score_bm25(
     query: str,
     index: dict,
@@ -248,15 +187,17 @@ def score_bm25(
     avg_doc_len = np.mean(doc_lengths) if doc_lengths else 1.0
 
     for token in query_tokens:
-        df = get_df(token, index)
+        df = len(index.get(token, {}))
         if df == 0:
             continue
 
-        idf = bm25_idf(df, num_docs)
+        idf = np.log((num_docs - df + 0.5) / (df + 0.5) + 1)
 
         if token in index:
             for doc_id, tf in index[token].items():
-                tf_norm = bm25_tf(tf, doc_lengths[doc_id], avg_doc_len, k1, b)
+                tf_norm = (tf * (k1 + 1)) / (
+                    tf + k1 * (1 - b + b * doc_lengths[doc_id] / avg_doc_len)
+                )
                 scores[doc_id] += idf * tf_norm
 
     return scores
@@ -316,6 +257,29 @@ def calculate_dcg(relevances: list[int], k: int = 10) -> float:
     return dcg
 
 
+def calculate_recall(
+    retrieved_ids: list[int], relevant_ids: set[int], k: int = 10
+) -> float:
+    """
+    Calculate Recall at position k.
+
+    Recall@k = (# relevant items in top-k) / (total # relevant items)
+
+    Args:
+        retrieved_ids: List of retrieved product IDs in rank order
+        relevant_ids: Set of all relevant product IDs for this query
+        k: Number of positions to consider
+
+    Returns:
+        Recall score (0 to 1)
+    """
+    if len(relevant_ids) == 0:
+        return 0.0
+    retrieved_at_k = set(retrieved_ids[:k])
+    found = len(retrieved_at_k & relevant_ids)
+    return found / len(relevant_ids)
+
+
 def calculate_ndcg(relevances: list[int], k: int = 10) -> float:
     """
     Calculate Normalized DCG at position k.
@@ -354,25 +318,25 @@ def get_relevance_grades(
 
 def evaluate_search(
     search_func,
-    products_df: pd.DataFrame,
     queries_df: pd.DataFrame,
     labels_df: pd.DataFrame,
     k: int = 10,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
-    Evaluate search across all queries.
+    Evaluate search across all queries using Recall@k.
+
+    Recall@k = (# relevant items found in top k) / (total # relevant items)
 
     Args:
         search_func: Function that takes query string and returns DataFrame with product_id
-        products_df: DataFrame of products
         queries_df: DataFrame of queries
         labels_df: DataFrame with relevance labels
         k: Number of results to consider
         verbose: Whether to print progress
 
     Returns:
-        DataFrame with query_id, query, and ndcg columns
+        DataFrame with query_id, query, and recall columns
     """
     results = []
 
@@ -382,16 +346,30 @@ def evaluate_search(
 
         search_results = search_func(query_text)
         product_ids = search_results["product_id"].tolist()[:k]
-        relevances = get_relevance_grades(product_ids, query_id, labels_df)
-        ndcg = calculate_ndcg(relevances, k)
 
-        results.append({"query_id": query_id, "query": query_text, "ndcg": ndcg})
+        # Recall calculation (grade > 0 = relevant)
+        query_labels = labels_df[labels_df["query_id"] == query_id]
+        relevant_ids = set(query_labels[query_labels["grade"] > 0]["product_id"])
+        retrieved_ids = set(product_ids)
+        recall = (
+            len(retrieved_ids & relevant_ids) / len(relevant_ids)
+            if relevant_ids
+            else 0.0
+        )
+
+        results.append(
+            {
+                "query_id": query_id,
+                "query": query_text,
+                "recall": recall,
+            }
+        )
 
     results_df = pd.DataFrame(results)
 
     if verbose:
         print(f"Evaluated {len(results_df)} queries")
-        print(f"Mean NDCG@{k}: {results_df['ndcg'].mean():.4f}")
+        print(f"Mean Recall@{k}: {results_df['recall'].mean():.4f}")
 
     return results_df
 
@@ -399,25 +377,6 @@ def evaluate_search(
 # ============================================================
 # EMBEDDINGS - API-BASED (OpenAI via LiteLLM)
 # ============================================================
-
-
-def get_embedding_openai(
-    text: str, model: str = "text-embedding-3-small"
-) -> np.ndarray:
-    """
-    Get embedding using OpenAI API via LiteLLM.
-
-    Args:
-        text: Text to embed
-        model: OpenAI embedding model name
-
-    Returns:
-        Embedding vector as numpy array
-    """
-    import litellm
-
-    response = litellm.embedding(model=model, input=[text])
-    return np.array(response.data[0]["embedding"])
 
 
 def batch_embed_openai(
@@ -482,21 +441,6 @@ def get_local_model(model_name: str = "all-MiniLM-L6-v2"):
     return _local_model_cache[model_name]
 
 
-def get_embedding_local(text: str, model_name: str = "all-MiniLM-L6-v2") -> np.ndarray:
-    """
-    Get embedding using a local Hugging Face model.
-
-    Args:
-        text: Text to embed
-        model_name: Hugging Face model name
-
-    Returns:
-        Embedding vector as numpy array
-    """
-    model = get_local_model(model_name)
-    return model.encode(text, convert_to_numpy=True)
-
-
 def batch_embed_local(
     texts: list[str],
     model_name: str = "all-MiniLM-L6-v2",
@@ -529,20 +473,6 @@ def batch_embed_local(
 # ============================================================
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Calculate cosine similarity between two vectors.
-
-    Args:
-        a: First vector
-        b: Second vector
-
-    Returns:
-        Cosine similarity (between -1 and 1)
-    """
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-
 def batch_cosine_similarity(query_emb: np.ndarray, doc_embs: np.ndarray) -> np.ndarray:
     """
     Calculate cosine similarity between query and all documents.
@@ -563,7 +493,7 @@ def semantic_search(
     query: str,
     product_embeddings: np.ndarray,
     products_df: pd.DataFrame,
-    embed_func=None,
+    model_name: str = "all-MiniLM-L6-v2",
     k: int = 10,
 ) -> pd.DataFrame:
     """
@@ -573,16 +503,14 @@ def semantic_search(
         query: The search query
         product_embeddings: Pre-computed product embeddings
         products_df: DataFrame of products
-        embed_func: Function to embed the query (defaults to get_embedding_local)
+        model_name: Hugging Face model name for embedding the query
         k: Number of results to return
 
     Returns:
         DataFrame with top-k products and similarity scores
     """
-    if embed_func is None:
-        embed_func = get_embedding_local
-
-    query_emb = embed_func(query)
+    model = get_local_model(model_name)
+    query_emb = model.encode(query, convert_to_numpy=True)
     similarities = batch_cosine_similarity(query_emb, product_embeddings)
 
     top_k_idx = np.argsort(-similarities)[:k]
@@ -590,30 +518,6 @@ def semantic_search(
     results["similarity"] = similarities[top_k_idx]
     results["rank"] = range(1, k + 1)
     return results
-
-
-# ============================================================
-# UTILITY
-# ============================================================
-
-
-def get_product_sample(
-    products_df: pd.DataFrame, n: int = 5000, seed: int = 42
-) -> pd.DataFrame:
-    """
-    Get a consistent sample of products.
-
-    Using the same seed ensures all students work with the same sample.
-
-    Args:
-        products_df: Full products DataFrame
-        n: Number of products to sample
-        seed: Random seed for reproducibility
-
-    Returns:
-        Sampled DataFrame with reset index
-    """
-    return products_df.sample(n=n, random_state=seed).reset_index(drop=True)
 
 
 def normalize_scores(scores: np.ndarray) -> np.ndarray:
